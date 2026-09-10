@@ -1,0 +1,35 @@
+name: worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/worker/**"
+      - "deploy/docker/worker.Dockerfile"
+      - ".github/workflows/worker.yml"
+  pull_request:
+    paths:
+      - "apps/worker/**"
+      - "deploy/docker/worker.Dockerfile"
+      - ".github/workflows/worker.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          # No go.sum yet - the worker has zero third-party dependencies
+          # in this phase, so there's nothing for module caching to key on.
+          cache: false
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
