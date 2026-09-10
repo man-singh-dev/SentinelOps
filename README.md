@@ -38,7 +38,7 @@ docker compose up --build
 Migrations are applied via the `migrate` one-off compose service:
 
 ```bash
-docker compose run --rm migrate up
+docker compose --profile tools run --rm migrate up
 ```
 
 ## Structure
