@@ -15,8 +15,12 @@ try {
 }
 
 const pool = createPool(config.DATABASE_URL);
-const app = buildServer(
-  { logLevel: config.LOG_LEVEL, prettyLogs: config.NODE_ENV !== 'production' },
+const app = await buildServer(
+  {
+    logLevel: config.LOG_LEVEL,
+    prettyLogs: config.NODE_ENV !== 'production',
+    corsOrigin: config.CORS_ORIGIN,
+  },
   pool,
 );
 

@@ -5,6 +5,7 @@ const envSchema = z.object({
   API_PORT: z.coerce.number().int().positive(),
   DATABASE_URL: z.string().url(),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+  CORS_ORIGIN: z.string().default('http://localhost:5173'),
 });
 
 export type Config = z.infer<typeof envSchema>;

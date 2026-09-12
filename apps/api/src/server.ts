@@ -1,12 +1,14 @@
 import Fastify, { type FastifyInstance } from 'fastify';
+import cors from '@fastify/cors';
 import type pg from 'pg';
 
 interface ServerOptions {
   logLevel: string;
   prettyLogs: boolean;
+  corsOrigin: string;
 }
 
-export function buildServer(options: ServerOptions, pool: pg.Pool): FastifyInstance {
+export async function buildServer(options: ServerOptions, pool: pg.Pool): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
       level: options.logLevel,
@@ -15,6 +17,8 @@ export function buildServer(options: ServerOptions, pool: pg.Pool): FastifyInsta
         : undefined,
     },
   });
+
+  await app.register(cors, { origin: options.corsOrigin });
 
   // Liveness: is the process alive and able to respond at all. Touches no
   // dependencies - Postgres being down is not a reason to restart the API;

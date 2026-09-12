@@ -7,6 +7,8 @@ bin = "tmp/worker"
 delay = 1000
 exclude_dir = ["tmp"]
 include_ext = ["go"]
+send_interrupt = true
+kill_delay = "10s"
 
 [log]
 time = true
