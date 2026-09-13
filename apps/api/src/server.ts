@@ -34,6 +34,61 @@ interface ServiceRow {
   id: string;
 }
 
+interface EventRow {
+  id: string;
+  service_id: string;
+  event_id: string;
+  event_type: string;
+  severity: (typeof SEVERITIES)[number];
+  message: string;
+  metadata: Record<string, unknown>;
+  occurred_at: string | Date;
+  received_at: string | Date;
+}
+
+const eventsQuerySchema = z.object({
+  service_id: z.string().uuid().optional(),
+  severity: z.enum(SEVERITIES).optional(),
+  // Bounded rather than clamped: a limit outside [1, 100] almost always
+  // means the caller has a bug (an off-by-one, a config value that leaked
+  // in unvalidated, etc). Silently clamping it to the nearest valid value
+  // would hide that bug behind a response that "looks fine" - same
+  // fail-fast reasoning as env validation in config.ts. An explicit 400
+  // surfaces the bug at the call site instead of downstream.
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  cursor: z.string().min(1).optional(),
+});
+
+// Cursor is "<received_at ISO>_<id>", base64-encoded. Neither an ISO
+// timestamp nor a UUID can contain "_", so a single split is unambiguous.
+function decodeCursor(cursor: string): { receivedAt: string; id: string } | null {
+  let decoded: string;
+  try {
+    decoded = Buffer.from(cursor, 'base64').toString('utf8');
+  } catch {
+    return null;
+  }
+
+  const separatorIndex = decoded.indexOf('_');
+  if (separatorIndex <= 0 || separatorIndex === decoded.length - 1) {
+    return null;
+  }
+
+  const receivedAt = decoded.slice(0, separatorIndex);
+  const id = decoded.slice(separatorIndex + 1);
+
+  if (Number.isNaN(Date.parse(receivedAt))) {
+    return null;
+  }
+
+  return { receivedAt, id };
+}
+
+function encodeCursor(receivedAt: string | Date, id: string): string {
+  const iso = receivedAt instanceof Date ? receivedAt.toISOString() : receivedAt;
+  return Buffer.from(`${iso}_${id}`).toString('base64');
+}
+
 export async function buildServer(options: ServerOptions, pool: Queryable): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
@@ -133,6 +188,88 @@ export async function buildServer(options: ServerOptions, pool: Queryable): Prom
     // move the actual write behind a queue, and that shift shouldn't
     // require this response code to change.
     return reply.status(202).send({ status: 'accepted' });
+  });
+
+  app.get('/api/v1/events', async (request, reply) => {
+    const parseResult = eventsQuerySchema.safeParse(request.query);
+    if (!parseResult.success) {
+      return reply.status(400).send({ error: parseResult.error.issues });
+    }
+
+    const { service_id: serviceId, severity, limit, cursor } = parseResult.data;
+
+    let cursorValues: { receivedAt: string; id: string } | null = null;
+    if (cursor !== undefined) {
+      cursorValues = decodeCursor(cursor);
+      if (!cursorValues) {
+        return reply.status(400).send({ error: 'malformed cursor' });
+      }
+    }
+
+    if (serviceId !== undefined) {
+      const serviceResult = await pool.query<ServiceRow>('SELECT id FROM services WHERE id = $1', [
+        serviceId,
+      ]);
+      if (!serviceResult.rows[0]) {
+        // 400, not 404: service_id here is a filter parameter the caller
+        // chose, not a resource being addressed by path - an unknown
+        // value is a bad request, the same as an invalid severity.
+        return reply.status(400).send({ error: `unknown service_id: ${serviceId}` });
+      }
+    }
+
+    const params: unknown[] = [serviceId ?? null, severity ?? null];
+
+    // Omit the keyset condition entirely on the first page rather than
+    // passing sentinel values for $3/$4 - there's no "smallest possible"
+    // (received_at, id) pair to sentinel against, and building the clause
+    // conditionally keeps the query planner's job simple (no OR branch to
+    // reason about for the common first-page case).
+    let cursorClause = '';
+    if (cursorValues) {
+      cursorClause = `AND (received_at, id) < ($${params.length + 1}, $${params.length + 2})`;
+      params.push(cursorValues.receivedAt, cursorValues.id);
+    }
+
+    // Fetch one row past the page size so "is there a next page" is
+    // answered from data already in hand, instead of a separate COUNT(*)
+    // query against the same table.
+    const limitParamIndex = params.length + 1;
+    params.push(limit + 1);
+
+    let result;
+    try {
+      // Keyset pagination on (received_at, id), not OFFSET: OFFSET has to
+      // walk and discard every skipped row, so cost grows linearly with
+      // page depth on a high-volume append-only table like this one.
+      // OFFSET also isn't safe under concurrent inserts - rows can shift
+      // position between requests, causing skipped or duplicated results
+      // across pages. Comparing the indexed (service_id, received_at)
+      // pair against a cursor is constant-cost per page and stable
+      // regardless of concurrent writes; id is included as a tiebreaker
+      // since received_at alone isn't guaranteed unique.
+      result = await pool.query<EventRow>(
+        `SELECT id, service_id, event_id, event_type, severity, message,
+                metadata, occurred_at, received_at
+         FROM events
+         WHERE (service_id = $1::uuid OR $1 IS NULL)
+           AND (severity = $2::severity OR $2 IS NULL)
+           ${cursorClause}
+         ORDER BY received_at DESC, id DESC
+         LIMIT $${limitParamIndex}`,
+        params,
+      );
+    } catch (err) {
+      request.log.error({ err }, 'failed to query events');
+      return reply.status(500).send({ error: 'internal server error' });
+    }
+
+    const hasNextPage = result.rows.length > limit;
+    const page = hasNextPage ? result.rows.slice(0, limit) : result.rows;
+    const lastRow = page[page.length - 1];
+    const nextCursor = hasNextPage && lastRow ? encodeCursor(lastRow.received_at, lastRow.id) : null;
+
+    return reply.status(200).send({ events: page, next_cursor: nextCursor });
   });
 
   return app;
