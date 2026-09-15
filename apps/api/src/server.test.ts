@@ -29,6 +29,7 @@ class FakePool implements Queryable {
   private services = [KNOWN_SERVICE, OTHER_SERVICE];
   private events: FakeEventRow[] = [];
   private nextEventNum = 1;
+  private nextServiceNum = 1;
 
   async query<T extends pg.QueryResultRow = never>(
     text: string,
@@ -44,6 +45,29 @@ class FakePool implements Queryable {
       const [id] = params;
       const rows = this.services.filter((service) => service.id === id).map((s) => ({ id: s.id }));
       return { rows, rowCount: rows.length } as unknown as pg.QueryResult<T>;
+    }
+
+    if (text.startsWith('INSERT INTO services')) {
+      const [name] = params as [string];
+      const isDuplicate = this.services.some((service) => service.name === name);
+      if (isDuplicate) {
+        // Mirrors what `pg` throws for a UNIQUE violation: an Error with
+        // a `code` of '23505', the Postgres error code for
+        // unique_violation - that's the only field the route inspects.
+        const error = new Error('duplicate key value violates unique constraint') as Error & {
+          code: string;
+        };
+        error.code = '23505';
+        throw error;
+      }
+
+      const service = {
+        id: `generated-service-${this.nextServiceNum++}`,
+        name,
+        created_at: new Date().toISOString(),
+      };
+      this.services.push(service);
+      return { rows: [service], rowCount: 1 } as unknown as pg.QueryResult<T>;
     }
 
     if (text.startsWith('INSERT INTO events')) {
@@ -246,6 +270,84 @@ describe('POST /api/v1/events', () => {
       url: '/api/v1/events',
       headers: { 'x-service-name': KNOWN_SERVICE.name },
       payload: { ...validPayload, metadata: { blob: 'x'.repeat(10_000) } },
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+});
+
+describe('POST /api/v1/services', () => {
+  it('registers a new service and returns 201 with the created row', async () => {
+    const { app } = await buildTestServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/services',
+      payload: { name: 'notification-service' },
+    });
+
+    expect(response.statusCode).toBe(201);
+    const body = response.json();
+    expect(body).toMatchObject({ name: 'notification-service' });
+    expect(body.id).toBeTruthy();
+    expect(body.created_at).toBeTruthy();
+  });
+
+  it('rejects a duplicate name with 409, not 400', async () => {
+    const { app } = await buildTestServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/services',
+      payload: { name: KNOWN_SERVICE.name },
+    });
+
+    expect(response.statusCode).toBe(409);
+  });
+
+  it('rejects a request with no name', async () => {
+    const { app } = await buildTestServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/services',
+      payload: {},
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('rejects an empty string name', async () => {
+    const { app } = await buildTestServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/services',
+      payload: { name: '' },
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('rejects an oversized name', async () => {
+    const { app } = await buildTestServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/services',
+      payload: { name: 'a'.repeat(256) },
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('rejects a name containing whitespace', async () => {
+    const { app } = await buildTestServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/services',
+      payload: { name: 'payment service' },
     });
 
     expect(response.statusCode).toBe(400);

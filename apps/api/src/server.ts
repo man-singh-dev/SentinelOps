@@ -34,6 +34,30 @@ interface ServiceRow {
   id: string;
 }
 
+interface CreatedServiceRow {
+  id: string;
+  name: string;
+  created_at: string | Date;
+}
+
+// Service names are later echoed back as the X-Service-Name header value on
+// every event this service sends, so the charset has to be safe there too,
+// not just as a display string. Restricting to letters, digits, hyphen,
+// underscore, and dot rules out whitespace and header-delimiter characters
+// (CR/LF, ':') in one pass, rather than trying to blocklist each unsafe
+// character individually.
+const SERVICE_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+const serviceBodySchema = z.object({
+  name: z
+    .string()
+    .min(1)
+    .max(255)
+    .regex(SERVICE_NAME_PATTERN, {
+      message: 'name must contain only letters, digits, ".", "_", or "-"',
+    }),
+});
+
 interface EventRow {
   id: string;
   service_id: string;
@@ -188,6 +212,63 @@ export async function buildServer(options: ServerOptions, pool: Queryable): Prom
     // move the actual write behind a queue, and that shift shouldn't
     // require this response code to change.
     return reply.status(202).send({ status: 'accepted' });
+  });
+
+  // No authentication exists yet (deferred to Phase 7, same as events
+  // ingestion above) - this route is open to any caller for now.
+  app.post('/api/v1/services', async (request, reply) => {
+    const parseResult = serviceBodySchema.safeParse(request.body);
+    if (!parseResult.success) {
+      return reply.status(400).send({ error: parseResult.error.issues });
+    }
+
+    const { name } = parseResult.data;
+
+    let result;
+    try {
+      // No SELECT-then-INSERT existence check: that's two round trips with
+      // a race between them (two concurrent requests for the same name
+      // could both pass the SELECT before either INSERTs). The UNIQUE
+      // constraint on `name` makes the insert itself the atomic check -
+      // same reasoning as the ON CONFLICT idempotency insert in
+      // POST /api/v1/events above.
+      result = await pool.query<CreatedServiceRow>(
+        'INSERT INTO services (name) VALUES ($1) RETURNING id, name, created_at',
+        [name],
+      );
+    } catch (err) {
+      const pgError = err as { code?: string };
+      if (pgError.code === '23505') {
+        // 409, not 400: the request itself is well-formed - it conflicts
+        // with existing state (a service with this name already exists).
+        // 400 would tell the caller their input is malformed and to
+        // retry differently; 409 tells them the name is already taken,
+        // which for a registration endpoint usually means "already done".
+        request.log.info({ name }, 'service registration rejected: name already exists');
+        return reply.status(409).send({ error: 'service already exists' });
+      }
+
+      request.log.error({ err }, 'failed to insert service');
+      return reply.status(500).send({ error: 'internal server error' });
+    }
+
+    const service = result.rows[0];
+    if (!service) {
+      // Unreachable in practice - a successful INSERT ... RETURNING always
+      // returns exactly one row - but narrows the type without an
+      // assertion, and fails loudly instead of sending a broken response
+      // if that assumption is ever wrong.
+      request.log.error('insert into services returned no row');
+      return reply.status(500).send({ error: 'internal server error' });
+    }
+
+    request.log.info({ service_id: service.id, name: service.name }, 'service registered');
+
+    // 201, not 202: unlike event ingestion, this route creates exactly one
+    // durable resource synchronously and directly, with no queue or async
+    // processing step planned between "accepted" and "done" - so the
+    // response can name the created resource immediately.
+    return reply.status(201).send(service);
   });
 
   app.get('/api/v1/events', async (request, reply) => {
