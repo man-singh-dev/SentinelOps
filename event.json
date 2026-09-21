@@ -1,0 +1,1 @@
+{"event_id":"test-1","event_type":"payment_failed","severity":"critical","message":"gateway timeout","occurred_at":"2026-09-15T10:00:00Z","metadata":{"gateway":"stripe","amount":4999}}

@@ -83,6 +83,13 @@ const eventsQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
 });
 
+const servicesQuerySchema = z.object({
+  // Bounded, not clamped: same fail-fast reasoning as eventsQuerySchema.limit
+  // above. A limit outside [1, 100] almost always signals a caller bug.
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  cursor: z.string().min(1).optional(),
+});
+
 // Cursor is "<received_at ISO>_<id>", base64-encoded. Neither an ISO
 // timestamp nor a UUID can contain "_", so a single split is unambiguous.
 function decodeCursor(cursor: string): { receivedAt: string; id: string } | null {
@@ -110,6 +117,39 @@ function decodeCursor(cursor: string): { receivedAt: string; id: string } | null
 
 function encodeCursor(receivedAt: string | Date, id: string): string {
   const iso = receivedAt instanceof Date ? receivedAt.toISOString() : receivedAt;
+  return Buffer.from(`${iso}_${id}`).toString('base64');
+}
+
+// Cursor for the services route: "<created_at ISO>_<id>", base64-encoded.
+// Same format as the events cursor (decodeCursor/encodeCursor above), with
+// created_at standing in for received_at — services have no received_at
+// column. Separate helpers rather than reusing the events pair so call-sites
+// are self-documenting if the two tables' column names ever diverge.
+function decodeServiceCursor(cursor: string): { createdAt: string; id: string } | null {
+  let decoded: string;
+  try {
+    decoded = Buffer.from(cursor, 'base64').toString('utf8');
+  } catch {
+    return null;
+  }
+
+  const separatorIndex = decoded.indexOf('_');
+  if (separatorIndex <= 0 || separatorIndex === decoded.length - 1) {
+    return null;
+  }
+
+  const createdAt = decoded.slice(0, separatorIndex);
+  const id = decoded.slice(separatorIndex + 1);
+
+  if (Number.isNaN(Date.parse(createdAt))) {
+    return null;
+  }
+
+  return { createdAt, id };
+}
+
+function encodeServiceCursor(createdAt: string | Date, id: string): string {
+  const iso = createdAt instanceof Date ? createdAt.toISOString() : createdAt;
   return Buffer.from(`${iso}_${id}`).toString('base64');
 }
 
@@ -351,6 +391,70 @@ export async function buildServer(options: ServerOptions, pool: Queryable): Prom
     const nextCursor = hasNextPage && lastRow ? encodeCursor(lastRow.received_at, lastRow.id) : null;
 
     return reply.status(200).send({ events: page, next_cursor: nextCursor });
+  });
+
+  // No authentication exists yet (deferred to Phase 7, same as the other
+  // routes above) — this route is open to any caller for now.
+  app.get('/api/v1/services', async (request, reply) => {
+    const parseResult = servicesQuerySchema.safeParse(request.query);
+    if (!parseResult.success) {
+      return reply.status(400).send({ error: parseResult.error.issues });
+    }
+
+    const { limit, cursor } = parseResult.data;
+
+    let cursorValues: { createdAt: string; id: string } | null = null;
+    if (cursor !== undefined) {
+      cursorValues = decodeServiceCursor(cursor);
+      if (!cursorValues) {
+        return reply.status(400).send({ error: 'malformed cursor' });
+      }
+    }
+
+    // No index on (created_at, id) for services exists yet. Services is
+    // expected to stay small (registered occasionally, not per-event), so a
+    // sequential scan is acceptable for now. If the table ever grows
+    // unexpectedly, add an index as a separate, deliberate step with its own
+    // migration — don't silently assume one will exist.
+    const params: unknown[] = [];
+
+    // Omit the keyset WHERE clause entirely on the first page — same reasoning
+    // as GET /api/v1/events: no sentinel pair exists for (created_at, id),
+    // and omitting the clause keeps the query planner's job simple (no OR
+    // branch to reason about for the common first-page case).
+    let cursorClause = '';
+    if (cursorValues) {
+      cursorClause = `WHERE (created_at, id) < ($${params.length + 1}, $${params.length + 2})`;
+      params.push(cursorValues.createdAt, cursorValues.id);
+    }
+
+    // Fetch one row past the page size to detect a next page without a
+    // separate COUNT(*) query — same trick as GET /api/v1/events.
+    const limitParamIndex = params.length + 1;
+    params.push(limit + 1);
+
+    let result;
+    try {
+      result = await pool.query<CreatedServiceRow>(
+        `SELECT id, name, created_at
+         FROM services
+         ${cursorClause}
+         ORDER BY created_at DESC, id DESC
+         LIMIT $${limitParamIndex}`,
+        params,
+      );
+    } catch (err) {
+      request.log.error({ err }, 'failed to query services');
+      return reply.status(500).send({ error: 'internal server error' });
+    }
+
+    const hasNextPage = result.rows.length > limit;
+    const page = hasNextPage ? result.rows.slice(0, limit) : result.rows;
+    const lastRow = page[page.length - 1];
+    const nextCursor =
+      hasNextPage && lastRow ? encodeServiceCursor(lastRow.created_at, lastRow.id) : null;
+
+    return reply.status(200).send({ services: page, next_cursor: nextCursor });
   });
 
   return app;

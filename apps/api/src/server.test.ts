@@ -3,8 +3,8 @@ import type pg from 'pg';
 import { buildServer } from './server.js';
 import type { Queryable } from './db.js';
 
-const KNOWN_SERVICE = { id: '11111111-1111-1111-1111-111111111111', name: 'payment-service' };
-const OTHER_SERVICE = { id: '22222222-2222-2222-2222-222222222222', name: 'auth-service' };
+const KNOWN_SERVICE = { id: '11111111-1111-1111-1111-111111111111', name: 'payment-service', created_at: '2026-01-01T00:00:00.000Z' };
+const OTHER_SERVICE = { id: '22222222-2222-2222-2222-222222222222', name: 'auth-service', created_at: '2026-01-01T00:00:01.000Z' };
 
 interface FakeEventRow {
   id: string;
@@ -18,6 +18,12 @@ interface FakeEventRow {
   received_at: string;
 }
 
+interface FakeServiceRow {
+  id: string;
+  name: string;
+  created_at: string;
+}
+
 // In-memory stand-in for pg.Pool, scoped to exactly the queries the events
 // routes issue. Keeps these tests fast and independent of a real Postgres
 // instance - the migration itself (0002_create_events_table) is what
@@ -26,7 +32,7 @@ interface FakeEventRow {
 // events_service_id_received_at_idx index the GET route's keyset query is
 // shaped around.
 class FakePool implements Queryable {
-  private services = [KNOWN_SERVICE, OTHER_SERVICE];
+  private services: FakeServiceRow[] = [KNOWN_SERVICE, OTHER_SERVICE];
   private events: FakeEventRow[] = [];
   private nextEventNum = 1;
   private nextServiceNum = 1;
@@ -131,6 +137,34 @@ class FakePool implements Queryable {
       return { rows, rowCount: rows.length } as unknown as pg.QueryResult<T>;
     }
 
+    if (text.startsWith('SELECT id, name, created_at')) {
+      // Params are always [limit+1] on the first page (1 element) or
+      // [createdAt, id, limit+1] when a cursor is applied (3 elements).
+      const hasCursor = params.length === 3;
+      const cursorCreatedAt = hasCursor ? (params[0] as string) : null;
+      const cursorId = hasCursor ? (params[1] as string) : null;
+      const limit = params[params.length - 1] as number;
+
+      let rows = this.services.slice();
+      rows.sort((a, b) => {
+        if (a.created_at !== b.created_at) {
+          return a.created_at < b.created_at ? 1 : -1;
+        }
+        return a.id < b.id ? 1 : -1;
+      });
+      if (hasCursor) {
+        rows = rows.filter((service) => {
+          if (service.created_at !== cursorCreatedAt) {
+            return service.created_at < (cursorCreatedAt as string);
+          }
+          return service.id < (cursorId as string);
+        });
+      }
+      rows = rows.slice(0, limit);
+
+      return { rows, rowCount: rows.length } as unknown as pg.QueryResult<T>;
+    }
+
     throw new Error(`FakePool received unexpected query: ${text}`);
   }
 
@@ -152,6 +186,17 @@ class FakePool implements Queryable {
       occurred_at: event.occurred_at ?? new Date().toISOString(),
       received_at: event.received_at ?? new Date().toISOString(),
       service_id: event.service_id,
+    });
+  }
+
+  // Test helper: seeds a service row directly, bypassing the POST route's
+  // insert logic, so tests can control created_at/id ordering precisely
+  // for pagination assertions.
+  seedService(service: Partial<FakeServiceRow> & { name: string }): void {
+    this.services.push({
+      id: service.id ?? `seed-service-${this.nextServiceNum++}`,
+      name: service.name,
+      created_at: service.created_at ?? new Date().toISOString(),
     });
   }
 }
@@ -505,5 +550,112 @@ describe('GET /api/v1/events', () => {
     const thirdBody = thirdPage.json();
     expect(thirdBody.events.map((e: { id: string }) => e.id)).toEqual(['evt-0']);
     expect(thirdBody.next_cursor).toBeNull();
+  });
+});
+
+describe('GET /api/v1/services', () => {
+  it('returns all services and null next_cursor when fewer rows than the limit', async () => {
+    // The FakePool starts with KNOWN_SERVICE and OTHER_SERVICE (2 rows), well
+    // below the default limit of 50, so next_cursor must be null.
+    const { app } = await buildTestServer();
+
+    const response = await app.inject({ method: 'GET', url: '/api/v1/services' });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.services).toHaveLength(2);
+    expect(body.next_cursor).toBeNull();
+  });
+
+  it('returns the first page and a next_cursor when more rows exist than the limit', async () => {
+    const { app, pool } = await buildTestServer();
+    // Seed 3 extra services; total pool = 5, which exceeds limit=4.
+    for (let i = 0; i < 3; i++) {
+      pool.seedService({ name: `extra-${i}`, created_at: timestampAt(i + 2) });
+    }
+
+    const response = await app.inject({ method: 'GET', url: '/api/v1/services?limit=4' });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.services).toHaveLength(4);
+    expect(body.next_cursor).not.toBeNull();
+  });
+
+  it('rejects limit=0 with 400', async () => {
+    const { app } = await buildTestServer();
+
+    const response = await app.inject({ method: 'GET', url: '/api/v1/services?limit=0' });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('rejects limit=101 with 400', async () => {
+    const { app } = await buildTestServer();
+
+    const response = await app.inject({ method: 'GET', url: '/api/v1/services?limit=101' });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('rejects a malformed cursor with 400', async () => {
+    const { app } = await buildTestServer();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/services?cursor=not-valid-base64-content!!!',
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('paginates via cursor with no overlap or skip between pages', async () => {
+    const { app, pool } = await buildTestServer();
+    // Seed 5 services at timestampAt(2)–timestampAt(6), placing them ahead of
+    // KNOWN_SERVICE (ts0) and OTHER_SERVICE (ts1) in DESC order. This gives a
+    // fully deterministic 4-page sequence with limit=2:
+    //   page 1: svc-4, svc-3
+    //   page 2: svc-2, svc-1
+    //   page 3: svc-0, OTHER_SERVICE
+    //   page 4: KNOWN_SERVICE  (next_cursor null — last row)
+    for (let i = 0; i < 5; i++) {
+      pool.seedService({ id: `svc-${i}`, name: `service-${i}`, created_at: timestampAt(i + 2) });
+    }
+
+    const firstPage = await app.inject({ method: 'GET', url: '/api/v1/services?limit=2' });
+    expect(firstPage.statusCode).toBe(200);
+    const firstBody = firstPage.json();
+    expect(firstBody.services.map((s: { id: string }) => s.id)).toEqual(['svc-4', 'svc-3']);
+    expect(firstBody.next_cursor).not.toBeNull();
+
+    const secondPage = await app.inject({
+      method: 'GET',
+      url: `/api/v1/services?limit=2&cursor=${encodeURIComponent(firstBody.next_cursor as string)}`,
+    });
+    expect(secondPage.statusCode).toBe(200);
+    const secondBody = secondPage.json();
+    expect(secondBody.services.map((s: { id: string }) => s.id)).toEqual(['svc-2', 'svc-1']);
+    expect(secondBody.next_cursor).not.toBeNull();
+
+    const thirdPage = await app.inject({
+      method: 'GET',
+      url: `/api/v1/services?limit=2&cursor=${encodeURIComponent(secondBody.next_cursor as string)}`,
+    });
+    expect(thirdPage.statusCode).toBe(200);
+    const thirdBody = thirdPage.json();
+    expect(thirdBody.services.map((s: { id: string }) => s.id)).toEqual([
+      'svc-0',
+      OTHER_SERVICE.id,
+    ]);
+    expect(thirdBody.next_cursor).not.toBeNull();
+
+    const fourthPage = await app.inject({
+      method: 'GET',
+      url: `/api/v1/services?limit=2&cursor=${encodeURIComponent(thirdBody.next_cursor as string)}`,
+    });
+    expect(fourthPage.statusCode).toBe(200);
+    const fourthBody = fourthPage.json();
+    expect(fourthBody.services.map((s: { id: string }) => s.id)).toEqual([KNOWN_SERVICE.id]);
+    expect(fourthBody.next_cursor).toBeNull();
   });
 });

@@ -15,8 +15,21 @@ services:
       timeout: 3s
       retries: 5
 
-  # One-off migration runner, not a long-running service. Activated
-  # explicitly: `docker compose --profile tools run --rm migrate up`
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    ports:
+      - "5672:5672"   
+      - "15672:15672"  
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
   migrate:
     image: migrate/migrate:v4.17.1
     profiles: ["tools"]
@@ -68,3 +81,4 @@ services:
 
 volumes:
   postgres_data:
+  rabbitmq_data:

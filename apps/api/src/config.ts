@@ -25,3 +25,4 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   return result.data;
 }
+//sabse phle yeah bna kyunki API ko chlne se phle yeah janan jaruri hai ki  database kahan hai
