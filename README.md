@@ -1,399 +1,576 @@
 # SentinelOps
 
-[![api](https://github.com/man-singh-dev/SentinelOps/actions/workflows/api.yml/badge.svg)](https://github.com/man-singh-dev/SentinelOps/actions/workflows/api.yml)
-[![worker](https://github.com/man-singh-dev/SentinelOps/actions/workflows/worker.yml/badge.svg)](https://github.com/man-singh-dev/SentinelOps/actions/workflows/worker.yml)
-[![web](https://github.com/man-singh-dev/SentinelOps/actions/workflows/web.yml/badge.svg)](https://github.com/man-singh-dev/SentinelOps/actions/workflows/web.yml)
+**Real-time incident intelligence and service reliability platform.**
 
-A distributed, real-time incident intelligence platform for service reliability.
+SentinelOps ingests high-volume events from applications and infrastructure, deduplicates and correlates them into incidents, and gives engineering teams a live dashboard to investigate and resolve failures.
 
-SentinelOps ingests high-volume events from applications and infrastructure, correlates
-them into incidents rather than drowning engineers in duplicate alerts, and surfaces
-service health on a live dashboard. Ten thousand identical payment-service failures
-should produce **one incident with ten thousand attached events**, not ten thousand
-pages at 3am.
+> **10,000 identical `payment-service` failures should produce 1 incident with 10,000 related events, not 10,000 alerts.**
 
-> **Build status: Phase 0 of 9.** This repository currently contains the runnable
-> skeleton — process wiring, health checks, config validation, graceful shutdown,
-> migrations, and CI. **There is no event ingestion, queue, or incident logic yet.**
-> The architecture below is the target; the [Roadmap](#roadmap) states exactly what
-> is built and what is not. Nothing here is deployed or production-tested.
+![Node.js](https://img.shields.io/badge/API-Node.js%20%2B%20TypeScript-339933?logo=node.js&logoColor=white)
+![Go](https://img.shields.io/badge/Workers-Go-00ADD8?logo=go&logoColor=white)
+![React](https://img.shields.io/badge/Dashboard-React%20%2B%20TypeScript-61DAFB?logo=react&logoColor=black)
+![PostgreSQL](https://img.shields.io/badge/DB-PostgreSQL-4169E1?logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/Cache-Redis-DC382D?logo=redis&logoColor=white)
+![RabbitMQ](https://img.shields.io/badge/Queue-RabbitMQ-FF6600?logo=rabbitmq&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
 
 ---
 
-## Table of contents
+## Table of Contents
 
-- [Why this exists](#why-this-exists)
-- [Target architecture](#target-architecture)
-- [What runs today](#what-runs-today)
-- [Design decisions](#design-decisions)
-- [Getting started](#getting-started)
-- [Project layout](#project-layout)
-- [Development](#development)
-- [Database](#database)
-- [Roadmap](#roadmap)
-- [Troubleshooting](#troubleshooting)
-
----
-
-## Why this exists
-
-Alerting systems fail in predictable ways. They create one incident per event, so a
-single database outage becomes a wall of noise. They process events synchronously, so
-an ingestion spike takes down the API that receives it. They retry naively, so a
-transient failure becomes an infinite loop. They lose events when a worker restarts
-mid-processing.
-
-SentinelOps is built around those failure modes specifically: asynchronous processing
-so ingestion stays cheap, deduplication so incidents map to root causes, idempotency
-so retried deliveries are harmless, bounded retries with a dead-letter queue so
-failures are visible rather than silent, and graceful shutdown so in-flight work
-drains instead of vanishing.
+1. [Project Status](#project-status)
+2. [Why SentinelOps](#why-sentinelops)
+3. [High-Level Architecture](#high-level-architecture)
+4. [Event Lifecycle](#event-lifecycle)
+5. [Core Concepts](#core-concepts)
+6. [Tech Stack and Rationale](#tech-stack-and-rationale)
+7. [Repository Structure](#repository-structure)
+8. [Getting Started](#getting-started)
+9. [API Overview](#api-overview)
+10. [Data Model](#data-model)
+11. [Security](#security)
+12. [Observability](#observability)
+13. [Scaling and Failure Modes](#scaling-and-failure-modes)
+14. [Roadmap](#roadmap)
+15. [Engineering Principles](#engineering-principles)
+16. [Contributing](#contributing)
+17. [License](#license)
 
 ---
 
-## Target architecture
+## Project Status
 
-The complete system. **Solid boxes are implemented; dashed boxes are not built yet.**
+SentinelOps is under active, incremental development. This README describes the **target design**. Features are marked honestly:
 
-```mermaid
-flowchart TB
-    ext["External Services<br/><i>apps, infra, agents</i>"]
+| Status | Meaning |
+|--------|---------|
+| ✅ Done | Implemented and tested |
+| 🚧 In progress | Being built |
+| 📋 Planned | Designed, not yet built |
 
-    subgraph ingest["Ingestion — Node.js + TypeScript"]
-        api["Fastify API<br/>auth · validation · rate limit · idempotency"]
-    end
-
-    subgraph broker["Messaging"]
-        mq["RabbitMQ<br/><i>work queue</i>"]
-        dlq["Dead Letter Queue"]
-    end
-
-    subgraph proc["Processing — Go worker pool"]
-        disp["Dispatcher<br/><i>channel fan-out</i>"]
-        w1["goroutine"]
-        w2["goroutine"]
-        w3["goroutine"]
-        logic["Fingerprint → dedup →<br/>correlate → incident"]
-    end
-
-    subgraph data["State"]
-        pg[("PostgreSQL<br/><i>source of truth</i>")]
-        redis[("Redis<br/><i>cache · counters · idempotency</i>")]
-    end
-
-    subgraph serve["Delivery"]
-        ws["WebSocket hub"]
-        web["React Dashboard"]
-    end
-
-    ext -->|"POST /api/v1/events"| api
-    api -->|"202 Accepted"| ext
-    api -->|publish| mq
-    api <--> redis
-    mq --> disp
-    disp --> w1 & w2 & w3
-    w1 & w2 & w3 --> logic
-    logic -->|"retries exhausted"| dlq
-    logic --> pg
-    logic --> redis
-    logic -->|"incident created / changed"| ws
-    pg --> api
-    ws -->|"live push"| web
-    api -->|"REST reads"| web
-
-    classDef built fill:#1f6f43,stroke:#2ea06a,color:#fff
-    classDef planned fill:#2b2b2b,stroke:#777,color:#ddd,stroke-dasharray: 5 3
-    classDef store fill:#1d3f6e,stroke:#3d7ab8,color:#fff
-
-    class api,web built
-    class pg store
-    class mq,dlq,disp,w1,w2,w3,logic,ws,redis,ext planned
-```
-
-### Request lifecycle (target)
-
-Why an event returns `202` before it has been processed, and what happens after:
-
-```mermaid
-sequenceDiagram
-    participant S as Service
-    participant A as API
-    participant R as Redis
-    participant Q as RabbitMQ
-    participant W as Go Worker
-    participant P as PostgreSQL
-    participant D as Dashboard
-
-    S->>A: POST /api/v1/events (event_id: abc123)
-    A->>R: rate limit check
-    A->>A: validate schema + API key
-    A->>R: SETNX idempotency:abc123
-    alt already seen
-        A-->>S: 202 (no-op, duplicate delivery)
-    else first delivery
-        A->>Q: publish
-        A-->>S: 202 Accepted
-    end
-
-    Q->>W: deliver (prefetch-bounded)
-    W->>W: compute fingerprint
-    W->>P: BEGIN
-    W->>P: find open incident matching fingerprint
-    alt match within time window
-        W->>P: attach event, bump last_seen
-    else no match
-        W->>P: create incident
-    end
-    W->>P: COMMIT
-    W->>Q: ack
-
-    Note over W,Q: nack + backoff on failure;<br/>to DLQ after N attempts
-
-    W->>D: WebSocket push
-```
-
-The key property: **the API never blocks on processing.** An ingestion spike grows the
-queue, not the API's latency. Workers scale independently of the ingestion tier, and
-a worker crash loses nothing because messages are only acked after the transaction
-commits.
+See the [Roadmap](#roadmap) for the per-phase status. Nothing in this repository should be read as a production-readiness or performance claim until it is backed by tests and benchmarks that live in the repo.
 
 ---
 
-## What runs today
+## Why SentinelOps
 
-Phase 0 in full. Everything below is implemented and reviewable in the commit history.
+During an outage, monitoring systems can generate thousands of near-identical alerts. Engineers drown in noise instead of fixing the problem. SentinelOps addresses this by:
+
+- **Decoupling ingestion from processing**: the API accepts events fast and hands off heavy work to a queue.
+- **Correlating events**: identical failures collapse into a single incident using a fingerprint and time window.
+- **Being safe under retries**: duplicate deliveries are treated as one logical event.
+- **Failing gracefully**: bounded retries with exponential backoff, then a Dead Letter Queue.
+- **Updating live**: engineers see new incidents and state changes over WebSockets, with no refresh.
+
+---
+
+## High-Level Architecture
 
 ```mermaid
 flowchart LR
-    web["React + Vite<br/>:5173"] -->|"GET /readyz"| api["Fastify API<br/>:3000"]
-    api -->|"SELECT 1"| pg[("PostgreSQL 16<br/>:5432")]
-    worker["Go worker<br/><i>heartbeat + graceful shutdown</i>"]
-    migrate["golang-migrate<br/><i>one-off</i>"] --> pg
+    subgraph EXT["External Systems"]
+        S1["Application Services"]
+        S2["Infrastructure / Agents"]
+    end
 
-    classDef built fill:#1f6f43,stroke:#2ea06a,color:#fff
-    classDef store fill:#1d3f6e,stroke:#3d7ab8,color:#fff
-    class web,api,worker,migrate built
-    class pg store
+    subgraph EDGE["Edge"]
+        NG["Nginx<br/>TLS / reverse proxy"]
+    end
+
+    subgraph API["Node.js + TypeScript API"]
+        direction TB
+        A1["Auth<br/>API key / JWT"]
+        A2["Validation<br/>schema checks"]
+        A3["Rate limiting<br/>Redis counters"]
+        A4["Idempotency<br/>fast-path check"]
+        A5["REST endpoints"]
+        A6["WebSocket gateway"]
+    end
+
+    MQ[["RabbitMQ<br/>events queue<br/>retry queues<br/>DLQ"]]
+
+    subgraph WORKERS["Go Worker Service"]
+        direction TB
+        W1["Consumer"]
+        W2["Worker pool<br/>goroutines + channels"]
+        W3["Dedup + correlation<br/>incident engine"]
+    end
+
+    subgraph DATA["Data Layer"]
+        PG[("PostgreSQL<br/>source of truth")]
+        RD[("Redis<br/>cache, rate limits,<br/>idempotency, pub/sub")]
+    end
+
+    subgraph UI["Frontend"]
+        FE["React + TypeScript<br/>Tailwind + React Query"]
+    end
+
+    S1 -->|"POST /api/v1/events"| NG
+    S2 -->|"POST /api/v1/events"| NG
+    NG --> A1
+    A1 --> A2 --> A3 --> A4
+    A4 -->|"publish"| MQ
+    A3 <--> RD
+    A4 <--> RD
+
+    MQ -->|"consume"| W1 --> W2 --> W3
+    W3 -->|"transactions"| PG
+    W3 -->|"publish updates"| RD
+
+    RD -->|"subscribe"| A6
+    A5 <-->|"queries"| PG
+    A5 <-->|"hot reads"| RD
+
+    FE -->|"HTTPS REST"| NG
+    FE <-->|"WebSocket"| A6
+    NG --> A5
+    NG --> A6
 ```
 
-| Component | State |
-|---|---|
-| `apps/api` | Fastify + TypeScript. Env validated at boot, structured logging via pino, `/healthz` and `/readyz`. **No business routes.** |
-| `apps/worker` | Go, zero external dependencies. Heartbeat every 5s, `signal.NotifyContext` shutdown with bounded drain. **No queue consumer.** |
-| `apps/web` | React + Vite + TypeScript. One page rendering API readiness. **No dashboard.** |
-| `db/migrations` | Plain SQL via `golang-migrate`. One migration: `services`. |
-| `docker-compose.yml` | Postgres + three apps, dev only. No Redis, no RabbitMQ yet — by design. |
-| `.github/workflows` | Path-filtered CI: lint, typecheck, build per app; `go vet` + `go test` for the worker. |
+### Component responsibilities
+
+| Component | Responsibility | Deliberately does NOT do |
+|-----------|----------------|--------------------------|
+| **Node.js API** | Authenticate, validate, rate limit, enqueue events; serve dashboard REST APIs; push real-time updates | Heavy event processing |
+| **RabbitMQ** | Durable buffer between ingestion and processing; retry and dead-letter routing | Business logic |
+| **Go workers** | Concurrent event processing, fingerprinting, deduplication, incident create/attach | Serve user-facing HTTP |
+| **PostgreSQL** | Source of truth for events, incidents, users, audit logs | Low-latency counters |
+| **Redis** | Rate limiting, short-lived idempotency keys, hot caches, pub/sub fan-out to WebSocket nodes | Durable storage |
+| **React dashboard** | Overview, incident list/detail, service health, live updates | Any business logic |
 
 ---
 
-## Design decisions
+## Event Lifecycle
 
-Full reasoning lives in [`docs/adr/`](docs/adr/). The four that shape everything else:
+The full path of a single event from arrival to dashboard update:
 
-**Migrations belong to neither service** ([ADR-0001](docs/adr/0001-plain-sql-migrations-owned-by-neither-service.md))
-Both the Node API and the Go worker read and write the same database. If each carried
-its own migration directory they would drift, and eventually a deploy would leave the
-worker expecting a column the API had not created. One directory, applied by a
-dedicated step before either service starts, removes the entire class of problem.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Svc as External Service
+    participant API as Node.js API
+    participant R as Redis
+    participant MQ as RabbitMQ
+    participant W as Go Worker
+    participant PG as PostgreSQL
+    participant WS as WebSocket Gateway
+    participant UI as React Dashboard
 
-**Liveness and readiness are different questions** ([ADR-0002](docs/adr/0002-separate-liveness-and-readiness-endpoints.md))
-`/healthz` asks "is this process alive" and touches nothing. `/readyz` asks "can I
-serve traffic right now" and checks Postgres. Conflating them means a database blip
-triggers a restart loop across the entire fleet — restarting the API does not fix
-Postgres, it just adds a crash-loop to an already-degraded system.
+    Svc->>API: POST /api/v1/events (API key)
+    API->>API: Authenticate and validate payload
+    API->>R: Rate limit check
+    alt limit exceeded
+        API-->>Svc: 429 Too Many Requests
+    end
+    API->>R: SETNX idempotency key (event_id)
+    alt duplicate event_id
+        API-->>Svc: 202 Accepted (already received)
+    end
+    API->>MQ: Publish event (persistent)
+    API-->>Svc: 202 Accepted
 
-**The worker starts with zero dependencies** ([ADR-0003](docs/adr/0003-go-worker-zero-dependencies-in-phase-0.md))
-The shutdown skeleton — context threaded through every call, `sync.WaitGroup`, bounded
-drain timeout — is what the whole worker pool hangs off. Built while it is trivially
-verifiable, not retrofitted into a running pool later.
+    MQ->>W: Deliver event
+    W->>W: Compute fingerprint
+    W->>PG: BEGIN
+    W->>PG: Insert event (unique service_id + event_id)
+    W->>PG: Find active incident by fingerprint and window
+    alt no active incident
+        W->>PG: Create incident and timeline entry
+    else incident exists
+        W->>PG: Link event, update last_detected_at and count
+    end
+    W->>PG: COMMIT
+    W->>MQ: ACK
+    W->>R: Publish incident update
+    R->>WS: Pub/Sub message
+    WS->>UI: WebSocket push (incident.created / updated)
+```
 
-**Postgres only, queue deferred** ([ADR-0004](docs/adr/0004-postgres-only-infra-defer-queue.md))
-Redis has no job until rate limiting. RabbitMQ has no job until ingestion exists.
-Starting containers nothing talks to teaches nothing. Each arrives in the phase where
-it solves a real problem, with its own ADR.
+**Key point:** the API returns `202 Accepted` as soon as the event is durably queued. Processing is asynchronous, so ingestion latency stays low and is independent of database load.
 
 ---
 
-## Getting started
+## Core Concepts
 
-**Prerequisites:** Docker Desktop with Compose v2. Node 20+ and Go 1.22+ only if you
-want to run services outside containers.
+### 1. Deduplication and correlation
 
-```bash
-git clone https://github.com/man-singh-dev/SentinelOps.git
-cd SentinelOps
-cp .env.example .env
-docker compose up --build
+Each event is reduced to a **fingerprint**:
+
+```
+fingerprint = hash(service + event_type + normalized_error_signature)
 ```
 
-Apply migrations in a second terminal:
+The worker looks up an **active incident** (not `RESOLVED`) with the same fingerprint inside a configurable **time window**. If found, the event is attached; otherwise, a new incident is created.
 
-```bash
-docker compose --profile tools run --rm migrate up
+- **Severity escalation:** if an attached event has higher severity, the incident severity is raised and a `severity_changed` event is emitted.
+- **Race safety:** two workers may process the same fingerprint simultaneously. A partial unique index on `(fingerprint) WHERE status <> 'RESOLVED'`, combined with `INSERT ... ON CONFLICT`, guarantees only one incident is created.
+- **Normalization:** volatile values (IDs, timestamps, memory addresses) are stripped from error messages so equivalent failures produce the same signature.
+
+### 2. Idempotency (two layers)
+
+| Layer | Mechanism | Purpose |
+|-------|-----------|---------|
+| Fast path | Redis `SET NX` with TTL on `event_id` | Reject obvious duplicates before they hit the queue |
+| Source of truth | PostgreSQL unique constraint on `(service_id, event_id)` | Correctness even if Redis is empty, evicted, or down |
+
+Redis is an optimization; PostgreSQL is the guarantee. If `abc123` arrives three times, exactly one logical event is stored.
+
+### 3. Retries, exponential backoff and Dead Letter Queue
+
+```mermaid
+flowchart LR
+    Q[["events queue"]] --> W["Worker"]
+    W -->|"success"| ACK["ACK"]
+    W -->|"failure, attempt < max"| R1[["retry queue<br/>TTL grows per attempt<br/>e.g. 1s, 5s, 30s"]]
+    R1 -->|"TTL expires, dead-lettered back"| Q
+    W -->|"failure, attempt = max"| DLQ[["Dead Letter Queue"]]
+    DLQ -.->|"inspect / reprocess"| OPS["Engineer"]
 ```
 
-`migrate` uses a Compose profile because it is a one-off task, not a long-running
-service — it should not restart with the stack or appear in `docker compose ps`.
+- Attempt count is tracked in message headers.
+- Retries are bounded, so there are no infinite loops.
+- Poison messages land in the DLQ with the failure reason attached, and can be inspected and replayed.
+- Workers only ACK after the database transaction commits (at-least-once delivery, made safe by idempotency).
 
-Verify:
+### 4. Go worker pool
 
-| Check | Expected |
-|---|---|
-| `curl localhost:3000/healthz` | `{"status":"ok"}` |
-| `curl localhost:3000/readyz` | `{"status":"ok"}`, or `503` with Postgres stopped |
-| http://localhost:5173 | Page showing API status |
-| `docker compose logs worker` | Heartbeat every 5s |
-| `docker compose stop worker` | Logs shutdown, exits cleanly — not SIGKILLed after 10s |
+```mermaid
+flowchart LR
+    C["RabbitMQ consumer<br/>(prefetch = N)"] --> J(["jobs channel<br/>buffered"])
+    J --> G1["worker 1"]
+    J --> G2["worker 2"]
+    J --> G3["worker ... N"]
+    G1 & G2 & G3 --> DB[("PostgreSQL<br/>pooled connections")]
+    CTX["context.Context<br/>SIGTERM"] -.->|"cancel"| C
+    CTX -.->|"drain in-flight jobs"| G1 & G2 & G3
+```
 
-### Configuration
+- A fixed number of goroutines pull from a buffered channel; the buffer size and RabbitMQ prefetch provide **backpressure**.
+- **Graceful shutdown:** on `SIGTERM`, the consumer stops accepting messages, in-flight jobs finish (bounded by a timeout), and unacked messages are redelivered.
+- Every DB call uses a `context` with a timeout.
 
-All config comes from environment variables and is **validated at startup**. A service
-with a missing or malformed variable refuses to start rather than failing later on
-first request. See [`.env.example`](.env.example) for the full surface.
+### 5. Incident lifecycle
 
-| Variable | Used by | Purpose |
-|---|---|---|
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | postgres | Database bootstrap |
-| `DATABASE_URL` | api, migrate | Connection string |
-| `API_PORT` | api | Listen port |
-| `NODE_ENV` | api | Pretty logs when not `production` |
-| `LOG_LEVEL` / `WORKER_LOG_LEVEL` | api / worker | Log verbosity |
-| `VITE_API_URL` | web | API base URL (`VITE_` prefix required to reach client code) |
+```mermaid
+stateDiagram-v2
+    [*] --> OPEN: first matching event
+    OPEN --> ACKNOWLEDGED: engineer acknowledges
+    ACKNOWLEDGED --> INVESTIGATING: engineer starts work
+    INVESTIGATING --> RESOLVED: fix confirmed
+    OPEN --> RESOLVED: auto/manual resolve
+    RESOLVED --> OPEN: regression (reopen)
+    RESOLVED --> [*]
+```
 
-Secrets are never committed. `.env` is gitignored; `.env.example` documents the shape
-with development-only values.
+Every transition writes an `incident_timeline` row and an `audit_logs` entry.
+
+### 6. Rate limiting
+
+Per-API-key and per-IP counters in Redis using a sliding-window or token-bucket algorithm. Exceeding a limit returns `429` with a `Retry-After` header.
+
+### 7. Redis usage (deliberately narrow)
+
+| Use case | Why Redis |
+|----------|-----------|
+| Rate limit counters | Atomic, fast, shared across API instances |
+| Idempotency keys (TTL) | Short-lived, cheap dedup fast path |
+| Dashboard stats / service health cache | Read-heavy, tolerant to seconds of staleness |
+| Pub/Sub for real-time updates | Lets multiple API instances broadcast to their own WebSocket clients |
+
+PostgreSQL remains the source of truth for everything.
 
 ---
 
-## Project layout
+## Tech Stack and Rationale
+
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Frontend | React, TypeScript, Tailwind, React Query | Typed UI; React Query handles caching, refetching and WebSocket-driven invalidation |
+| API | Node.js, TypeScript, Fastify | Strong I/O concurrency, schema-based validation, low overhead |
+| Workers | Go | Goroutines and channels suit CPU/IO-bound concurrent processing and graceful shutdown |
+| Queue | RabbitMQ | Per-message ACK, TTL and dead-letter exchanges map directly to retries and DLQ |
+| Database | PostgreSQL | Transactions, constraints, partial unique indexes, relational integrity |
+| Cache | Redis | Atomic counters, TTL keys, pub/sub |
+| Infra | Docker, Docker Compose, Nginx, GitHub Actions | Reproducible local env, reverse proxy, CI/CD |
+| Cloud (later) | AWS | Deployment target |
+
+**Why not Kafka?** Kafka excels at replayable, high-throughput event streams. SentinelOps needs per-message acknowledgement, delayed retries and DLQ routing, which RabbitMQ provides natively with less operational weight. This decision can be revisited if replay or very high throughput become requirements.
+
+---
+
+## Repository Structure
+
+Target layout (created incrementally starting in Phase 0):
 
 ```
 SentinelOps/
 ├── apps/
-│   ├── api/                 Node 20 · TypeScript · Fastify
-│   │   └── src/
-│   │       ├── config.ts    env parsing + validation, fails fast
-│   │       ├── db.ts        pg Pool
-│   │       ├── logger.ts    pino
-│   │       ├── server.ts    route registration
-│   │       └── index.ts     composition root
-│   ├── worker/              Go 1.22
-│   │   ├── cmd/worker/      main, signal handling, shutdown
-│   │   └── internal/
-│   │       ├── config/      env parsing
-│   │       └── heartbeat/   placeholder unit of work
-│   └── web/                 React · TypeScript · Vite
-├── db/migrations/           plain SQL, golang-migrate
-├── deploy/docker/           Dockerfiles (dev: hot reload, not production images)
-├── docs/adr/                architecture decision records
-├── .github/workflows/       path-filtered CI
-└── docker-compose.yml
+│   ├── api/                 # Node.js + TypeScript API (REST + WebSocket)
+│   │   ├── src/
+│   │   │   ├── modules/     # events, incidents, services, auth, users
+│   │   │   ├── plugins/     # db, redis, queue, auth, rate-limit
+│   │   │   └── ws/          # WebSocket gateway
+│   │   └── tests/
+│   └── web/                 # React + TypeScript dashboard
+│       └── src/
+├── services/
+│   └── worker/              # Go worker service
+│       ├── cmd/worker/      # entrypoint
+│       └── internal/        # consumer, pool, incident engine, store
+├── db/
+│   └── migrations/          # versioned SQL migrations
+├── infra/
+│   ├── docker/
+│   └── nginx/
+├── docs/
+│   ├── architecture.md
+│   └── adr/                 # architecture decision records
+├── .github/workflows/       # CI
+├── docker-compose.yml
+├── .env.example
+└── README.md
 ```
-
-Monorepo, deliberately. The event contract crosses three languages — adding a field
-touches the Node validator, the Go struct, and the React types together. One commit,
-one CI run, no window where the API accepts a field the worker silently drops. The
-cost is path-filtered CI and no per-service versioning, neither of which matters until
-separate teams deploy on separate cadences.
 
 ---
 
-## Development
+## Getting Started
 
-Run a service natively against containerized Postgres:
+> 📋 **Planned.** The commands below describe the intended developer workflow and will work once Phase 0 is complete.
 
-```bash
-docker compose up postgres -d
+### Prerequisites
 
-cd apps/api    && npm install && npm run dev
-cd apps/worker && go run ./cmd/worker
-cd apps/web    && npm install && npm run dev
-```
+- Docker and Docker Compose
+- Node.js 20+ and pnpm/npm (for local API/web development)
+- Go 1.22+ (for local worker development)
 
-Note that `DATABASE_URL` in `.env` uses the Compose hostname `postgres`. Running the
-API on the host requires `localhost` instead.
-
-Per-app commands:
+### Run locally
 
 ```bash
-# api / web
-npm run lint && npm run typecheck && npm run build
+git clone https://github.com/man-singh-dev/SentinelOps.git
+cd SentinelOps
 
-# worker
-go vet ./... && go build ./... && go test ./...
+cp .env.example .env        # fill in values; never commit secrets
+docker compose up --build
 ```
 
-CI runs exactly these, filtered by path so a frontend change does not rebuild the Go
-worker.
+| Service | URL |
+|---------|-----|
+| Dashboard | http://localhost:5173 |
+| API | http://localhost:3000 |
+| RabbitMQ management | http://localhost:15672 |
+
+### Send a test event
+
+```bash
+curl -X POST http://localhost:3000/api/v1/events \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $SERVICE_API_KEY" \
+  -d '{
+    "event_id": "evt_abc123",
+    "service": "payment-service",
+    "event_type": "payment.failed",
+    "severity": "critical",
+    "message": "Gateway timeout while charging card",
+    "timestamp": "2026-01-01T12:00:00Z",
+    "metadata": { "region": "ap-south-1", "gateway": "stripe" }
+  }'
+```
+
+Expected: `202 Accepted`. Sending the same `event_id` again must not create a second event.
+
+### Configuration
+
+All configuration is via environment variables (see `.env.example`). No secrets are hardcoded.
+
+| Variable | Purpose |
+|----------|---------|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `REDIS_URL` | Redis connection string |
+| `AMQP_URL` | RabbitMQ connection string |
+| `JWT_SECRET` | User token signing |
+| `WORKER_CONCURRENCY` | Number of worker goroutines |
+| `DEDUP_WINDOW_SECONDS` | Correlation window for incidents |
+| `MAX_RETRY_ATTEMPTS` | Attempts before DLQ |
+| `RATE_LIMIT_PER_MINUTE` | Default per-key limit |
 
 ---
 
-## Database
+## API Overview
 
-PostgreSQL is the source of truth. Redis, when it arrives, is a cache and never
-authoritative.
+Base path: `/api/v1`. Final contract will be published as OpenAPI.
 
-```bash
-docker compose --profile tools run --rm migrate up        # apply
-docker compose --profile tools run --rm migrate down 1    # roll back one
-docker compose --profile tools run --rm migrate version   # current version
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `POST` | `/events` | Service API key | Ingest an event (returns `202`) |
+| `GET` | `/incidents` | Viewer+ | List with filter, sort, pagination |
+| `GET` | `/incidents/:id` | Viewer+ | Details, related events, timeline |
+| `PATCH` | `/incidents/:id/status` | Engineer+ | Acknowledge / investigate / resolve |
+| `POST` | `/incidents/:id/notes` | Engineer+ | Add a note |
+| `GET` | `/services` | Viewer+ | Service list with health |
+| `GET` | `/services/:id` | Viewer+ | Metrics, incidents, recent events |
+| `POST` | `/services` | Admin | Register a service and issue API key |
+| `GET` | `/stats/overview` | Viewer+ | Dashboard aggregates (cached) |
+| `GET` | `/dlq` | Admin | Inspect dead-lettered events |
+| `POST` | `/dlq/:id/reprocess` | Admin | Replay a dead-lettered event |
+| `GET` | `/health`, `/metrics` | Internal | Liveness and Prometheus metrics |
+
+**Real-time (WebSocket)** events: `incident.created`, `incident.severity_changed`, `incident.acknowledged`, `incident.resolved`, `service.health_changed`.
+
+**Standard responses:** `202` accepted, `400` validation error, `401/403` auth errors, `409` conflict, `429` rate limited, `5xx` server errors, all using a consistent structured error body.
+
+---
+
+## Data Model
+
+PostgreSQL is designed around real requirements; tables are added as features land, not all upfront.
+
+```mermaid
+erDiagram
+    USERS ||--o{ AUDIT_LOGS : performs
+    TEAMS ||--o{ USERS : has
+    TEAMS ||--o{ SERVICES : owns
+    SERVICES ||--o{ SERVICE_API_KEYS : has
+    SERVICES ||--o{ EVENTS : emits
+    SERVICES ||--o{ INCIDENTS : affected
+    INCIDENTS ||--o{ INCIDENT_EVENTS : groups
+    EVENTS ||--o{ INCIDENT_EVENTS : belongs
+    INCIDENTS ||--o{ INCIDENT_TIMELINE : records
+    USERS ||--o{ INCIDENTS : assigned
+
+    EVENTS {
+        uuid id PK
+        text event_id "client-supplied"
+        uuid service_id FK
+        text event_type
+        text severity
+        text fingerprint
+        jsonb metadata
+        timestamptz occurred_at
+        timestamptz received_at
+    }
+    INCIDENTS {
+        uuid id PK
+        uuid service_id FK
+        text title
+        text severity
+        text status
+        text fingerprint
+        int event_count
+        timestamptz first_detected_at
+        timestamptz last_detected_at
+        uuid assigned_to FK
+    }
+    INCIDENT_TIMELINE {
+        uuid id PK
+        uuid incident_id FK
+        text kind
+        uuid actor_id FK
+        jsonb detail
+        timestamptz created_at
+    }
 ```
 
-Migrations are plain, forward-only SQL with explicit `.up.sql` / `.down.sql` pairs. No
-ORM-generated schema: the schema is a design artifact worth reading and reviewing
-directly, and generated migrations obscure exactly the details — index choice,
-constraint naming, column ordering — that matter under load.
+**Important constraints and indexes**
 
-Current schema is `services` only. Tables arrive when a requirement needs them, not
-speculatively.
+- `UNIQUE (service_id, event_id)` on `events`, the idempotency guarantee.
+- Partial unique index on `incidents (fingerprint) WHERE status <> 'RESOLVED'`, preventing duplicate active incidents.
+- Indexes on `incidents (status, severity, last_detected_at DESC)` for list queries.
+- `CHECK` constraints on severity and status enums.
+- Keyset (cursor) pagination for large lists.
+- Consider time-based partitioning of `events` as volume grows.
+
+---
+
+## Security
+
+| Concern | Approach |
+|---------|----------|
+| User authentication | Password hashing (argon2/bcrypt) + short-lived JWT access tokens |
+| Service authentication | Per-service API keys; only hashes stored; revocable and rotatable |
+| Authorization | RBAC: **Admin** (users, services, settings), **Engineer** (investigate, acknowledge, resolve, notes), **Viewer** (read-only) |
+| Input validation | Schema validation on every external input |
+| Abuse protection | Redis-backed rate limiting, payload size limits |
+| Audit logging | Actor, action, target and timestamp for security-relevant actions, e.g. `USER_A ACKNOWLEDGED INCIDENT INC-1024` |
+| Secrets | Environment variables only; `.env` is gitignored |
+| Transport | TLS terminated at Nginx |
+
+---
+
+## Observability
+
+SentinelOps monitors itself (Phase 8):
+
+- **Metrics:** events processed/sec, queue depth, worker utilization, processing latency, retry count, failed events, API latency, DB pool health
+- **Logs:** structured JSON with correlation/request IDs across API and workers
+- **Health:** `/health` (liveness) and readiness checks for PostgreSQL, Redis and RabbitMQ
+
+---
+
+## Scaling and Failure Modes
+
+| Scenario | Behavior |
+|----------|----------|
+| Traffic spike | API keeps accepting; queue absorbs the burst; workers drain at their own pace |
+| Slow workers | Queue depth grows (visible in metrics); scale worker replicas horizontally |
+| Worker crash mid-job | Message is unacked and redelivered; idempotency prevents double effects |
+| Duplicate delivery | Redis fast path + PostgreSQL unique constraint |
+| Redis unavailable | Rate limiting falls back per policy; idempotency still enforced by PostgreSQL |
+| PostgreSQL slow or down | Workers retry with backoff, then DLQ; API still enqueues |
+| Poison message | Bounded retries, then DLQ for inspection |
+| Multiple API instances | Redis pub/sub fans real-time updates out to every WebSocket node |
+
+**Scaling levers:** API instances behind Nginx (stateless), worker replicas consuming the same queue, PostgreSQL read replicas and partitioning, Redis for hot reads.
+
+**Known trade-offs**
+
+- At-least-once delivery means correctness depends on idempotent writes.
+- Eventual consistency between ingestion and dashboard (typically sub-second, not guaranteed).
+- Redis pub/sub is fire-and-forget; the dashboard should refetch on reconnect.
 
 ---
 
 ## Roadmap
 
-| Phase | Scope | State |
-|---|---|---|
-| **0** | Skeleton: structure, health, config, migrations, shutdown, CI | ✅ Complete |
-| **1** | Event ingestion, domain model, REST API, Postgres persistence | ⬜ Not started |
-| **2** | RabbitMQ, Go worker pool consuming real work | ⬜ Not started |
-| **3** | Deduplication, idempotency, retries with backoff, DLQ, rate limiting | ⬜ Not started |
-| **4** | Redis caching and distributed counters | ⬜ Not started |
-| **5** | WebSockets, live dashboard updates | ⬜ Not started |
-| **6** | Dashboard: overview, incident list/detail, service views | ⬜ Not started |
-| **7** | Auth, RBAC, service API keys, audit logging | ⬜ Not started |
-| **8** | Observability: throughput, queue depth, latency, worker utilization | ⬜ Not started |
-| **9** | Production images, CI/CD, cloud deployment | ⬜ Not started |
+| Phase | Scope | Status |
+|-------|-------|--------|
+| 0 | Foundation: repo structure, API/web/worker skeletons, Docker Compose, PostgreSQL, Redis, CI | 📋 Planned |
+| 1 | Core backend: domain models, `Event → API → PostgreSQL` | 📋 Planned |
+| 2 | Event-driven: `API → RabbitMQ → Go worker → PostgreSQL` | 📋 Planned |
+| 3 | Reliability: dedup, idempotency, retries, backoff, DLQ | 📋 Planned |
+| 4 | Redis: caching, rate limiting, short-lived state | 📋 Planned |
+| 5 | Real-time: WebSockets and live updates | 📋 Planned |
+| 6 | Frontend: overview, incident list/detail, service views | 📋 Planned |
+| 7 | Security: auth, RBAC, service API keys, audit logs | 📋 Planned |
+| 8 | Observability: metrics, tracing, health | 📋 Planned |
+| 9 | Deployment: containers, CI/CD, AWS | 📋 Planned |
 
-Phase 1 writes to Postgres synchronously from the API; Phase 2 moves that write behind
-the queue. This is a **planned refactor, not rework** — validation, schema, and tests
-all survive, and only the final step of the handler changes from insert to publish.
+Update this table as phases are actually completed and tested.
 
 ---
 
-## Troubleshooting
+## Engineering Principles
 
-**`docker compose up` fails on missing variables** — `.env` does not exist. Run
-`cp .env.example .env`. Compose interpolates from `.env` in the project root and
-errors on unset variables rather than substituting empty strings.
+- Every technology solves a real problem; nothing is added for résumé value.
+- Simple, maintainable code over unnecessary abstraction.
+- Validate all external input; never hardcode secrets.
+- Tests for important business logic (fingerprinting, dedup, lifecycle transitions, retry policy).
+- Structured errors and structured logging throughout.
+- Small, meaningful commits.
+- No unverified performance or production claims; benchmarks are added to `docs/` with reproducible steps.
 
-**`/readyz` returns 503** — Postgres is not accepting connections. Check
-`docker compose ps` and `docker compose logs postgres`. `/healthz` should still return
-200; if it does not, the API process itself is down.
+Architecture decisions are recorded as ADRs in [`docs/adr`](docs/adr).
 
-**Port already allocated** — something else holds 5432, 3000, or 5173. Change the host
-side of the mapping in `docker-compose.yml`, or stop the conflicting process.
+---
 
-**Migrations fail with connection refused** — the `migrate` service waits for the
-Postgres healthcheck, so this usually means `DATABASE_URL` points at `localhost`
-instead of the Compose hostname `postgres`.
+## Contributing
 
-**Worker takes 10s to stop** — Docker sent SIGTERM, nothing handled it, and SIGKILL
-followed. The graceful shutdown path is not being exercised; check that signals reach
-the Go binary rather than being swallowed by the hot-reload wrapper.
+1. Fork the repo and create a feature branch (`feat/<short-description>`).
+2. Keep changes focused; add or update tests.
+3. Use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`).
+4. Open a pull request describing what changed and why.
 
 ---
 
 ## License
 
-Not yet licensed. All rights reserved pending a decision.
+To be decided. Add a `LICENSE` file (e.g. MIT) before accepting external contributions.
