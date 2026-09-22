@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/man-singh-dev/SentinelOps/apps/worker/internal/config"
+	"github.com/man-singh-dev/SentinelOps/apps/worker/internal/db"
 	"github.com/man-singh-dev/SentinelOps/apps/worker/internal/heartbeat"
+	"github.com/man-singh-dev/SentinelOps/apps/worker/internal/queue"
 )
 
 const (
@@ -33,6 +35,23 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Connect to PostgreSQL; fail fast if the DSN is wrong or the server is
+	// unreachable — a worker that can't reach its data store is useless.
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("failed to connect to postgres", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("postgres connected")
+
+	// Connect to RabbitMQ for the same reason.
+	amqpConn, err := queue.Open(cfg.RabbitMQURL)
+	if err != nil {
+		logger.Error("failed to connect to rabbitmq", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("rabbitmq connected")
 
 	// Every long-running loop registers here before it starts and calls
 	// Done when it returns. There's only the heartbeat today; a queue
@@ -58,6 +77,12 @@ func main() {
 	select {
 	case <-done:
 		logger.Info("shutdown complete")
+		// Close connections in reverse-open order, after all goroutines
+		// have drained, so no in-flight work races with teardown.
+		logger.Info("closing rabbitmq connection")
+		queue.Close(amqpConn)
+		logger.Info("closing postgres pool")
+		db.Close(pool)
 	case <-time.After(shutdownTimeout):
 		logger.Warn("shutdown timed out, forcing exit")
 		os.Exit(1)

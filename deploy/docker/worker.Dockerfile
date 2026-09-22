@@ -1,6 +1,6 @@
 # Dev-only image: air rebuilds and restarts the worker on file change,
 # the same hot-reload role tsx plays for api/web. Not a production build.
-FROM golang:1.23-alpine
+FROM golang:1.25-alpine
 
 WORKDIR /app
 
