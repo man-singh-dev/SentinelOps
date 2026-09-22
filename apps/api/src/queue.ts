@@ -24,6 +24,22 @@ async function declareTopology(): Promise<void> {
   _logger?.info('rabbitmq topology declared');
 }
 
+// Publishes a validated event payload to the events exchange. Returns true if
+// the broker accepted the message, false if the channel is not available.
+// Throws if channel.publish() itself throws (e.g. channel is closed/blocked),
+// so callers can distinguish "no channel" (false) from "publish error" (throw).
+export function publishEvent(payload: Record<string, unknown>): boolean {
+  if (!channel) {
+    return false;
+  }
+  return channel.publish(
+    'events.exchange',
+    'event',
+    Buffer.from(JSON.stringify(payload)),
+    { persistent: true },
+  );
+}
+
 // Closes the AMQP connection if one is open. Called from the graceful-shutdown
 // handler in index.ts alongside app.close() and pool.end().
 export async function closeQueue(): Promise<void> {

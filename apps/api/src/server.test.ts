@@ -218,8 +218,12 @@ const validPayload = {
   occurred_at: '2026-01-01T00:00:00.000Z',
 };
 
+// Duplicate-handling tests (ON CONFLICT DO NOTHING) belong with the worker's
+// test suite once it exists — the API no longer performs that check (Phase 2.6).
 describe('POST /api/v1/events', () => {
-  it('accepts a valid request', async () => {
+  // publishEvent() returns false when no real broker channel is wired up.
+  // A FakeChannel / injectable queue abstraction is future test debt.
+  it('returns 503 when the queue channel is unavailable', async () => {
     const { app } = await buildTestServer();
 
     const response = await app.inject({
@@ -229,8 +233,8 @@ describe('POST /api/v1/events', () => {
       payload: validPayload,
     });
 
-    expect(response.statusCode).toBe(202);
-    expect(response.json()).toEqual({ status: 'accepted' });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({ error: 'failed to publish event' });
   });
 
   it('rejects a request with no X-Service-Name header', async () => {
@@ -286,26 +290,6 @@ describe('POST /api/v1/events', () => {
     expect(response.statusCode).toBe(400);
   });
 
-  it('treats a duplicate (service_id, event_id) delivery as a no-op 202', async () => {
-    const { app, pool } = await buildTestServer();
-
-    const first = await app.inject({
-      method: 'POST',
-      url: '/api/v1/events',
-      headers: { 'x-service-name': KNOWN_SERVICE.name },
-      payload: validPayload,
-    });
-    const second = await app.inject({
-      method: 'POST',
-      url: '/api/v1/events',
-      headers: { 'x-service-name': KNOWN_SERVICE.name },
-      payload: validPayload,
-    });
-
-    expect(first.statusCode).toBe(202);
-    expect(second.statusCode).toBe(202);
-    expect(pool.insertedCount).toBe(1);
-  });
 
   it('rejects oversized metadata', async () => {
     const { app } = await buildTestServer();

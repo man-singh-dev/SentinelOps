@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import { z } from 'zod';
 import type { Queryable } from './db.js';
+import { publishEvent } from './queue.js';
 
 interface ServerOptions {
   logLevel: string;
@@ -221,36 +222,33 @@ export async function buildServer(options: ServerOptions, pool: Queryable): Prom
 
     const event = parseResult.data;
 
-    // ON CONFLICT DO NOTHING, not DO UPDATE: (service_id, event_id) is the
-    // idempotency key, and a retried delivery of the same event must be a
-    // true no-op - the first delivery's row is what's kept, and the
-    // caller can't tell a retry apart from a first delivery from the
-    // response either way (both get 202 below).
-    const insertResult = await pool.query(
-      `INSERT INTO events (service_id, event_id, event_type, severity, message, metadata, occurred_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (service_id, event_id) DO NOTHING`,
-      [
-        service.id,
-        event.event_id,
-        event.event_type,
-        event.severity,
-        event.message,
-        event.metadata,
-        event.occurred_at,
-      ],
-    );
+    // Dedup (ON CONFLICT DO NOTHING) now lives in the worker's INSERT, not
+    // here - the API can no longer tell new from duplicate, and doesn't need
+    // to. Publishing to the exchange is the durable-acceptance boundary: if
+    // that fails the caller must retry; if it succeeds we owe them a 202.
+    let published: boolean;
+    try {
+      published = publishEvent({ ...event, service_id: service.id });
+    } catch (err) {
+      request.log.error(
+        { err, service_id: service.id, event_id: event.event_id },
+        'event publish failed',
+      );
+      return reply.status(503).send({ error: 'failed to publish event' });
+    }
 
-    const outcome = insertResult.rowCount === 0 ? 'duplicate-ignored' : 'accepted';
+    if (!published) {
+      request.log.error(
+        { service_id: service.id, event_id: event.event_id },
+        'event publish failed: channel unavailable',
+      );
+      return reply.status(503).send({ error: 'failed to publish event' });
+    }
+
     // Never log metadata or message - both may carry sensitive data from
     // the sending service.
-    request.log.info({ service_id: service.id, event_id: event.event_id, outcome }, 'event ingested');
+    request.log.info({ service_id: service.id, event_id: event.event_id }, 'event published');
 
-    // 202, not 201, for both branches above: this endpoint's contract is
-    // "durably accepted," not "fully processed," and the caller shouldn't
-    // be able to distinguish a retry from a first delivery. Phase 2 will
-    // move the actual write behind a queue, and that shift shouldn't
-    // require this response code to change.
     return reply.status(202).send({ status: 'accepted' });
   });
 
