@@ -54,15 +54,30 @@ func main() {
 	logger.Info("rabbitmq connected")
 
 	// Every long-running loop registers here before it starts and calls
-	// Done when it returns. There's only the heartbeat today; a queue
-	// consumer added later follows the identical wg.Add(1)/go func(){...}
-	// pattern, so shutdown draining doesn't need to change shape.
+	// Done when it returns. New goroutines follow the identical
+	// wg.Add(1)/go func(){...} pattern so shutdown draining never needs
+	// to change shape.
 	var wg sync.WaitGroup
+
+	// Open the consumer before starting goroutines; fail fast if the queue
+	// is unreachable so we don't spin up a half-wired worker.
+	deliveries, err := queue.Consume(amqpConn)
+	if err != nil {
+		logger.Error("failed to start consumer", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("consumer started", "queue", "events.incoming")
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		heartbeat.Run(ctx, logger, heartbeatInterval)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		queue.Run(ctx, logger, deliveries)
 	}()
 
 	<-ctx.Done()
