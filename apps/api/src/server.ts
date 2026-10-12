@@ -1,40 +1,40 @@
-import Fastify from "fastify";
 import { env } from "./config/env";
-import errorHandler from "./plugins/error-handler";
-import dbPlugin from "./plugins/db";
+import { buildServer } from "./app";
 
-const buildServer = () => {
-  const app = Fastify({
-    logger: {
-      level: "info",
-    },
-  });
 
-  app.register(errorHandler);
-  app.register(dbPlugin);
+const app = buildServer();
+let isShuttingDown = false;
 
-  app.get("/health", () => {
-    return {
-      status: "ok",
-    };
-  });
+const shutdown = async (signal: string): Promise<void> => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
 
-  return app;
+  app.log.info({ signal }, "Shutdown signal received — closing server");
+
+  try {
+    await app.close();
+    app.log.info("Server closed cleanly");
+    process.exit(0);
+  } catch (err) {
+    app.log.error({ err }, "Error during shutdown");
+    process.exit(1);
+  }
 };
 
-const start = async () => {
-  const app = buildServer();
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
+
+const start = async (): Promise<void> => {
   try {
     await app.listen({
       port: env.PORT,
+      host: "0.0.0.0",
     });
   } catch (err) {
-    app.log.error(err);
+    app.log.error({ err }, "Failed to start server");
     process.exit(1);
   }
 };
 
 void start();
-//tells ESLint:
-//"I know this function returns a Promise. I'm intentionally starting it here without awaiting it."
