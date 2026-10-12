@@ -2,7 +2,8 @@ import type { FastifyPluginAsync } from "fastify";
 import fp from "fastify-plugin";
 import { STATUS_CODES } from "node:http";
 
-interface ErrorResponse {//this defines the shape of the error response
+interface ErrorResponse {
+  //this defines the shape of the error response
   statusCode: number;
   error: string;
   message: string;
@@ -11,18 +12,23 @@ interface ErrorResponse {//this defines the shape of the error response
 // eslint-disable-next-line @typescript-eslint/require-await -- FastifyPluginAsync requires async signature
 const errorHandler: FastifyPluginAsync = async (app) => {
   //this tells fastify whenver an error happens in a request send it through this function
-  app.setErrorHandler((error: unknown, request, reply) => {//here unknown is used,its imp to check its importance here
+  app.setErrorHandler((error: unknown, request, reply) => {
+    //here unknown is used,its imp to check its importance here
     const errorStatusCode =
       typeof error === "object" &&
       error !== null &&
       "statusCode" in error &&
       typeof error.statusCode === "number"
-        ? error.statusCode//agr yeah 4 condn true higa tabhi true hoga nahi to undefined kar denge=>this is type narrowing
+        ? error.statusCode //agr yeah 4 condn true higa tabhi true hoga nahi to undefined kar denge=>this is type narrowing
         : undefined;
 
     // Prefer the error's status, then a status already set on the reply, else 500.
     let statusCode = 500;
-    if (errorStatusCode !== undefined && errorStatusCode >= 400 && errorStatusCode < 600) {
+    if (
+      errorStatusCode !== undefined &&
+      errorStatusCode >= 400 &&
+      errorStatusCode < 600
+    ) {
       statusCode = errorStatusCode;
     } else if (reply.statusCode >= 400 && reply.statusCode < 600) {
       statusCode = reply.statusCode;
