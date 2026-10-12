@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import { env } from "./config/env";
 import errorHandler from "./plugins/error-handler";
+import dbPlugin from "./plugins/db";
 
 const buildServer = () => {
   const app = Fastify({
@@ -10,13 +11,13 @@ const buildServer = () => {
   });
 
   app.register(errorHandler);
+  app.register(dbPlugin);
 
   app.get("/health", () => {
     return {
       status: "ok",
     };
   });
- 
 
   return app;
 };

@@ -5,7 +5,13 @@
   "main": "index.js",
   "scripts": {
     "dev": "tsx src/server.ts",
-    "lint": "node --require ./scripts/eslint-ts-compat.cjs ./node_modules/eslint/bin/eslint.js ."
+    "lint": "node --require ./scripts/eslint-ts-compat.cjs ./node_modules/eslint/bin/eslint.js .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
   },
   "keywords": [],
   "author": "",
@@ -13,18 +19,29 @@
   "type": "commonjs",
   "dependencies": {
     "dotenv": "^18.0.5",
+    "drizzle-orm": "^0.45.3",
     "fastify": "^5.12.5",
     "fastify-plugin": "^6.0.0",
     "pino": "^10.4.0",
+    "postgres": "^3.4.9",
     "zod": "^4.6.5"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.6.4",
+    "drizzle-kit": "^0.31.11",
     "eslint": "^10.12.0",
+    "prettier": "^3.9.10",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "typescript-eslint": "^8.71.0",
-    "typescript-eslint-ts": "npm:typescript@^5.8.3"
+    "typescript-eslint-ts": "npm:typescript@^5.8.3",
+    "vite": "^7.3.7",
+    "vitest": "^5.0.3"
+  },
+  "overrides": {
+    "@esbuild-kit/core-utils": {
+      "esbuild": "0.25.12"
+    }
   }
 }
