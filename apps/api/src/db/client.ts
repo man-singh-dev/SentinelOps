@@ -17,5 +17,5 @@ export const createDb = (connectionString: string = env.DATABASE_URL) => {
   };
 };
 
-export type DbConnection = ReturnType<typeof createDb>;
+export type DbConnection = ReturnType<typeof createDb>;//extract the return type of the createDb function
 export type Database = DbConnection["db"];

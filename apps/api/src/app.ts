@@ -1,6 +1,8 @@
 import Fastify from "fastify";
 import errorHandler from "./plugins/error-handler";
 import dbPlugin from "./plugins/db";
+import serviceRoutes from "./modules/services/routes";
+import eventRoutes from "./modules/events/routes";
 
 export const buildServer = () => {
   const app = Fastify({
@@ -19,6 +21,10 @@ export const buildServer = () => {
   app.get("/health", () => {
     return { status: "ok" };
   });
+
+  // --- Module routes (Step 2) ---
+  app.register(serviceRoutes, { prefix: "/api/v1/services" });
+  app.register(eventRoutes, { prefix: "/api/v1/events" });
 
   return app;
 };

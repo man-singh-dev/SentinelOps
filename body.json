@@ -1,0 +1,1 @@
+{"eventId":"evt_manual_001","eventType":"payment.failed","severity":"critical","timestamp":"2026-01-01T12:00:00Z","message":"Gateway timeout"}
