@@ -440,6 +440,54 @@ make demo
 
 Boots the stack, registers a service, sends 10,000 identical `payment-service` failures, waits for the queue to drain, and prints the resulting incident count and `event_count`.
 
+### Stage 2: run the API locally
+
+The full stack and demo above are the target. In Stage 2, `docker-compose.yml` provides PostgreSQL, Redis and RabbitMQ, and the API runs from source against PostgreSQL:
+
+```bash
+cp .env.example .env          # the port in DATABASE_URL must match the postgres host port in docker-compose.yml
+docker compose up -d postgres
+cd apps/api
+npm ci --legacy-peer-deps
+npm run db:migrate
+npm run dev                   # API on http://localhost:3000
+```
+
+### Register a service
+
+```bash
+curl -X POST http://localhost:3000/api/v1/services \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "payment-service", "description": "Handles card payments" }'
+```
+
+`name` is required and must be unique. `description`, `status` (`operational`, `degraded`, `partial_outage`, `major_outage`, `maintenance`) and `ownerTeamId` (UUID of an existing team) are optional. The API creates the service and its first API key and returns `201 Created`:
+
+```json
+{
+  "service": {
+    "id": "6f1c2a3b-4d5e-4f60-8a71-9b8c7d6e5f40",
+    "name": "payment-service",
+    "description": "Handles card payments",
+    "status": "operational",
+    "ownerTeamId": null,
+    "createdAt": "2026-01-01T12:00:00.000Z",
+    "updatedAt": "2026-01-01T12:00:00.000Z"
+  },
+  "apiKey": {
+    "id": "0b7e4d2c-9a1f-4c3e-8d5b-2f6a7c8e9d01",
+    "keyPrefix": "sk_AbCdEfGhI",
+    "key": "sk_AbCdEfGhI..."
+  }
+}
+```
+
+A duplicate `name` returns `409 Conflict`; an invalid body or unknown `ownerTeamId` returns `400 Bad Request`.
+
+**Save `apiKey.key` now.** It appears only in this response. SentinelOps stores only its SHA-256 hash, which cannot be reversed, so the key cannot be recovered or shown again; Stage 2 has no key-rotation endpoint to issue a replacement. Keep it in a secret store or an environment variable (for example `SERVICE_API_KEY`), never in source control. `keyPrefix` is safe to display for identifying the key.
+
+> **Security limitation (Stage 2):** `POST /api/v1/services` is not protected by user authentication yet (admin-only access arrives with auth and RBAC in Stage 7). Anyone who can reach the API can register a service and obtain a key, so do not expose the API publicly without access controls in front of it.
+
 ### Send a test event
 
 ```bash
@@ -447,9 +495,8 @@ curl -X POST http://localhost:3000/api/v1/events \
   -H "Content-Type: application/json" \
   -H "X-API-Key: $SERVICE_API_KEY" \
   -d '{
-    "event_id": "evt_abc123",
-    "service": "payment-service",
-    "event_type": "payment.failed",
+    "eventId": "evt_abc123",
+    "eventType": "payment.failed",
     "severity": "critical",
     "message": "Gateway timeout while charging card",
     "timestamp": "2026-01-01T12:00:00Z",
@@ -457,7 +504,28 @@ curl -X POST http://localhost:3000/api/v1/events \
   }'
 ```
 
-Expected: `202 Accepted`. Sending the same `event_id` again does not create a second event.
+Required fields are `eventId`, `eventType`, `severity` and `timestamp`; `message` and `metadata` are optional. The service is identified by the API key. An optional `serviceId` may be sent, but it must match the key's service or the request is rejected with `403`.
+
+Expected: `201 Created` during Stage 2 (see the [Stage 2 note](#api-overview) under API Overview); `202 Accepted` once the queued design is in place. Sending the same `eventId` again does not create a second event (Stage 2 returns `200 OK` with `"duplicate": true`).
+
+To check duplicate handling, run the same `curl` command twice. The first response is `201 Created` with `{"id": "...", "eventId": "evt_abc123", "duplicate": false}`; the second is `200 OK` with `{"eventId": "evt_abc123", "duplicate": true}`. PostgreSQL still holds one row:
+
+```bash
+docker exec sentinelops-postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> \
+  -c "SELECT count(*) FROM events WHERE event_id = 'evt_abc123';"
+```
+
+On Windows, `scripts/test-events.ps1` runs these cases (missing or invalid key, validation errors, service ID mismatch, new event, duplicate) against a running API. It reads the key from `$env:SENTINELOPS_API_KEY`.
+
+### Run the tests
+
+```bash
+cd apps/api
+npm test                  # unit tests; PostgreSQL integration tests are skipped
+RUN_DB_TESTS=1 npm test   # also runs the PostgreSQL integration tests
+```
+
+The integration tests need a migrated database at `DATABASE_URL` (`npm run db:migrate`). They create and delete their own services, keys and events. In PowerShell, use `$env:RUN_DB_TESTS = "1"; npm test`.
 
 ### Configuration
 
@@ -496,6 +564,11 @@ Base path: `/api/v1`. The contract is published as OpenAPI.
 | `GET` | `/dlq` | Admin | Inspect dead-lettered events |
 | `POST` | `/dlq/:id/reprocess` | Admin | Replay a dead-lettered event |
 | `GET` | `/health`, `/ready`, `/metrics` | Internal | Liveness, readiness, Prometheus metrics |
+
+> **Stage 2 (synchronous ingestion):** until the RabbitMQ publish path exists, `POST /events`
+> writes the event directly to PostgreSQL and returns `201 Created` for a new event or
+> `200 OK` for a duplicate `eventId`. `202 Accepted` is reserved for the queued design,
+> where it is returned only after the broker confirms the publish (ADR-001).
 
 **Real-time (WebSocket) events:** `incident.created`, `incident.severity_changed`, `incident.acknowledged`, `incident.resolved`, `service.health_changed`.
 
@@ -576,6 +649,8 @@ erDiagram
 | Transport | TLS terminated at Nginx |
 
 Authorization is covered by a role × endpoint test matrix.
+
+> **Stage 2 limitation:** user authentication and RBAC are not implemented yet, so `POST /api/v1/services` (which issues API keys) is unauthenticated. Do not expose the API publicly until access controls are in place.
 
 ---
 

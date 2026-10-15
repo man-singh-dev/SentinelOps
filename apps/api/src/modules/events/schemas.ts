@@ -1,10 +1,5 @@
 import { z } from "zod";
-export const eventSeverityValues = [
-  "critical",
-  "high",
-  "medium",
-  "low",
-] as const;
+export const eventSeverityValues = ["critical", "high", "medium", "low"] as const;
 
 export type EventSeverity = (typeof eventSeverityValues)[number];
 export const ingestEventBodySchema = z.object({
@@ -13,6 +8,8 @@ export const ingestEventBodySchema = z.object({
     .trim()
     .min(1, "eventId is required")
     .max(255, "eventId must be 255 characters or fewer"),
+  // Optional; if present it must match the service authenticated by the API key.
+  serviceId: z.string().uuid("serviceId must be a valid UUID").optional(),
   eventType: z
     .string()
     .trim()

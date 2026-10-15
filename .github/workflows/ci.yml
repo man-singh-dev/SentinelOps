@@ -148,6 +148,11 @@ jobs:
       - name: Re-apply migrations (must be idempotent)
         run: npm run db:migrate
 
+      - name: PostgreSQL integration tests
+        env:
+          RUN_DB_TESTS: "1"
+        run: npm test
+
       - name: Verify migrations match the schema
         working-directory: .
         run: |

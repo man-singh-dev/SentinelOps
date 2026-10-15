@@ -12,8 +12,6 @@ const validBody = {
 };
 
 describe("ingestEventBodySchema", () => {
-
-
   it("accepts the README example body", () => {
     const result = ingestEventBodySchema.safeParse(validBody);
     expect(result.success).toBe(true);
@@ -64,10 +62,14 @@ describe("ingestEventBodySchema", () => {
     expect(result.success).toBe(true);
   });
 
-  
-
   it("rejects missing eventId", () => {
-    const body = { eventType: validBody.eventType, severity: validBody.severity, message: validBody.message, timestamp: validBody.timestamp, metadata: validBody.metadata };
+    const body = {
+      eventType: validBody.eventType,
+      severity: validBody.severity,
+      message: validBody.message,
+      timestamp: validBody.timestamp,
+      metadata: validBody.metadata,
+    };
     const result = ingestEventBodySchema.safeParse(body);
     expect(result.success).toBe(false);
   });
@@ -86,7 +88,13 @@ describe("ingestEventBodySchema", () => {
   });
 
   it("rejects missing eventType", () => {
-    const body = { eventId: validBody.eventId, severity: validBody.severity, message: validBody.message, timestamp: validBody.timestamp, metadata: validBody.metadata };
+    const body = {
+      eventId: validBody.eventId,
+      severity: validBody.severity,
+      message: validBody.message,
+      timestamp: validBody.timestamp,
+      metadata: validBody.metadata,
+    };
     const result = ingestEventBodySchema.safeParse(body);
     expect(result.success).toBe(false);
   });
@@ -105,7 +113,13 @@ describe("ingestEventBodySchema", () => {
   });
 
   it("rejects missing severity", () => {
-    const body = { eventId: validBody.eventId, eventType: validBody.eventType, message: validBody.message, timestamp: validBody.timestamp, metadata: validBody.metadata };
+    const body = {
+      eventId: validBody.eventId,
+      eventType: validBody.eventType,
+      message: validBody.message,
+      timestamp: validBody.timestamp,
+      metadata: validBody.metadata,
+    };
     const result = ingestEventBodySchema.safeParse(body);
     expect(result.success).toBe(false);
   });
@@ -116,7 +130,13 @@ describe("ingestEventBodySchema", () => {
   });
 
   it("rejects missing timestamp", () => {
-    const body = { eventId: validBody.eventId, eventType: validBody.eventType, severity: validBody.severity, message: validBody.message, metadata: validBody.metadata };
+    const body = {
+      eventId: validBody.eventId,
+      eventType: validBody.eventType,
+      severity: validBody.severity,
+      message: validBody.message,
+      metadata: validBody.metadata,
+    };
     const result = ingestEventBodySchema.safeParse(body);
     expect(result.success).toBe(false);
   });
@@ -170,6 +190,19 @@ describe("ingestEventBodySchema", () => {
     if (result.success) {
       expect("unknownField" in result.data).toBe(false);
     }
+  });
+
+  it("accepts an optional serviceId UUID", () => {
+    const result = ingestEventBodySchema.safeParse({
+      ...validBody,
+      serviceId: "6f1c2a3b-4d5e-4f60-8a71-9b8c7d6e5f40",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a serviceId that is not a UUID", () => {
+    const result = ingestEventBodySchema.safeParse({ ...validBody, serviceId: "svc_1" });
+    expect(result.success).toBe(false);
   });
 
   it("rejects a completely empty object", () => {
